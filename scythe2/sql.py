@@ -5,7 +5,7 @@ import copy
 import itertools
 from collections import namedtuple
 
-from scythe2.synth_utils import *
+from scythe2.filter_synth import *
 
 
 # special symbol used in the language
@@ -33,21 +33,31 @@ class Node(ABC):
 	def infer_output_info(self, inputs):
 		pass
 
+	@abstractmethod
+	def replace_bvfilter_with_filter(self, inputs, constants, max_out_cnt):
+		pass
+
 	@staticmethod
 	def load_from_dict(ast):
 		"""given a dictionary represented AST, load it in to a program form"""
 		constructors = {
 			"project": Project,
 			"filter": Filter,
+			"bv_filter": BVFilter,
 			"aggregate": Aggregate,
 			"join": Join
 		}
 		if ast["op"] == "table_ref":
 			return Table(ast["children"][0]["value"])
 		else:
-			node = constructors[ast["op"]](
-						Node.load_from_dict(ast["children"][0]), 
-						*[arg["value"] for arg in ast["children"][1:]])
+			if ast["op"] == "join":
+				node = constructors[ast["op"]](
+							Node.load_from_dict(ast["children"][0]), 
+							Node.load_from_dict(ast["children"][1]))
+			else:
+				node = constructors[ast["op"]](
+							Node.load_from_dict(ast["children"][0]), 
+							*[arg["value"] for arg in ast["children"][1:]])
 			return node
 
 	def to_stmt_dict(self):
@@ -99,12 +109,23 @@ class Node(ABC):
 	
 	def stmt_string(self):
 		"""generate a string from stmts, for the purpose of pretty printing"""
+
+		def val_to_str(x):
+			if x["value"] == HOLE:
+				return "?"
+			if x["type"] == "bv_filter":
+				return "".join(["|" if k else "." for k in x["value"][:min(5, len(x["value"]))]])
+			# if x["type"] == "predicates":
+			# 	return pred_to_str(x["value"], hide_type=True)
+			else:
+				return str(x["value"])
+
 		stmts = self.to_stmt_dict()
 		result = []
 		for s in stmts:
 			lhs = s['return_as']
 			f = s['op']
-			arg_str = ', '.join([str(x['value']) for x in s["children"]])
+			arg_str = ', '.join([val_to_str(x) for x in s["children"]])
 			result.append(f"{lhs} <- {f}({arg_str})")
 		return "; ".join(result)
 
@@ -139,6 +160,9 @@ class Table(Node):
 			df = inp
 		return df
 
+	def replace_bvfilter_with_filter(self, inputs, constants, max_out_cnt):
+		return [Table(self.data_id)]
+
 	def to_dict(self):
 		return {
 			"type": "node",
@@ -154,7 +178,7 @@ class Project(Node):
 
 	def infer_domain(self, arg_id, inputs, config):
 		if arg_id == 1:
-			input_schema = self.q.infer_output_info(inputs)
+			input_schema, _ = self.q.infer_output_info(inputs)
 			col_num = len(input_schema)
 			col_list_candidates = []
 			for size in range(1, col_num + 1):
@@ -175,6 +199,13 @@ class Project(Node):
 	def backward_eval(self, output):
 		# the input table should contain every value appear in the output table
 		return [output]
+
+	def replace_bvfilter_with_filter(self, inputs, constants, max_out_cnt):
+		subq_list = self.q.replace_bvfilter_with_filter(inputs, constants, max_out_cnt)
+		q_list = []
+		for q in subq_list:
+			q_list.append(Project(q, self.cols))
+		return q_list
 
 	def to_dict(self):
 		return {
@@ -205,6 +236,17 @@ class Join(Node):
 				.merge(df2.assign(temp_join_key=1), on="temp_join_key")
 				.drop("temp_join_key", axis=1))
 
+	def replace_bvfilter_with_filter(self, inputs, constants, max_out_cnt):
+		subq1_list = self.q1.replace_bvfilter_with_filter(inputs, constants, max_out_cnt)
+		subq2_list = self.q2.replace_bvfilter_with_filter(inputs, constants, max_out_cnt)
+		q_list = []
+		for q1 in subq1_list:
+			for q2 in subq2_list:
+				q_list.append(Join(q1, q2))
+				if len(q_list) >= max_out_cnt:
+					return q_list
+		return q_list
+
 	def to_dict(self):
 		return {
 			"type": "node",
@@ -226,8 +268,6 @@ class BVFilter(Node):
 		self.bv = bv
 
 	def infer_domain(self, arg_id, inputs, config):
-		assert arg_id == 1
-		assert not self.q.is_abstract()
 
 		df = self.q.eval(inputs)
 		dtypes, table_boundaries = self.q.infer_output_info(inputs)
@@ -248,7 +288,30 @@ class BVFilter(Node):
 
 	def eval(self, inputs):
 		df = self.q.eval(inputs)
-		return df[self.bv]
+		return df[list(self.bv)]
+
+	def replace_bvfilter_with_filter(self, inputs, constants, max_out_cnt):
+
+		if all(list(self.bv)):
+			# the filter is all true, so there is no need to do filtering
+			return [copy.deepcopy(self.q)]
+		
+		df = self.q.eval(inputs)
+		dtypes, table_boundaries = self.q.infer_output_info(inputs)
+		bv_by_size_w_trace = enum_bv_predicates(df, dtypes, table_boundaries, constants)
+
+		concrete_preds = instantiate_predicate(df, bv_by_size_w_trace, self.bv, beam_size=max_out_cnt)
+
+		subq_list = self.q.replace_bvfilter_with_filter(inputs, constants, max_out_cnt)
+
+		q_list = []
+		for q in subq_list:
+			for preds in concrete_preds:
+				q_list.append(Filter(q, preds))
+				if len(q_list) >= max_out_cnt:
+					return q_list
+
+		return q_list
 
 	def to_dict(self):
 		return {
@@ -256,10 +319,7 @@ class BVFilter(Node):
 			"op": "bv_filter",
 			"children": [
 				self.q.to_dict(),
-				{ 
-					"type": "predicates", 
-					"value": value_to_dict(self.bv, "bv_filter") 
-				}
+				value_to_dict(self.bv, "bv_filter")
 			]}
 
 
@@ -279,17 +339,27 @@ class Filter(Node):
 
 	def eval(self, inputs):
 		df = self.q.eval(inputs)
+
 		for p in self.predicates:
-			if p.type == "column":
-				filter_exp = lambda x: op_to_lambda(p.op)(x[df.columns[p.left]], x[df.columns[p.right]])
-			elif p.type == "value":
-				filter_exp = lambda x: op_to_lambda(p.op)(x[df.columns[p.left]], p.right)
+			left, op, right, ty = p[0], p[1], p[2], p[3]
+
+			if ty == "column":
+				filter_exp = lambda x: op_to_lambda(op)(x[df.columns[left]], x[df.columns[right]])
+			elif ty == "value":
+				filter_exp = lambda x: op_to_lambda(op)(x[df.columns[left]], right)
 			else:
 				print("[Error] Filter predicate argument is wrong")
 				sys.exit(-1)
 
 			df = df[df.apply(filter_exp, axis=1)]
 		return df
+
+	def replace_bvfilter_with_filter(self, inputs, constants, max_out_cnt):
+		subq_list = self.q.replace_bvfilter_with_filter(inputs, constants, max_out_cnt)
+		q_list = []
+		for q in subq_list:
+			q_list.append(Filter(q, self.predicates))
+		return q_list
 
 	def to_dict(self):
 		return {
@@ -299,7 +369,7 @@ class Filter(Node):
 				self.q.to_dict(),
 				{
 					"type": "predicates",
-					"value": [(p.left, p.op, p.right, p.type) for p in self.predicates]
+					"value": [p for p in self.predicates]
 				}
 			]}
 
@@ -311,7 +381,7 @@ class Aggregate(Node):
 		self.aggr_func = aggr_func
 
 	def infer_domain(self, arg_id, inputs, config):
-		schema = self.q.infer_output_info(inputs)
+		schema, _ = self.q.infer_output_info(inputs)
 		if arg_id == 1:
 			# approximation: only get fields with more than one values
 			# for the purpose of avoiding empty fields
@@ -380,10 +450,17 @@ class Aggregate(Node):
 		res = res.rename(columns={target: f'{self.aggr_func}_{target}'}).reset_index()
 		return res
 
+	def replace_bvfilter_with_filter(self, inputs, constants, max_out_cnt):
+		subq_list = self.q.replace_bvfilter_with_filter(inputs, constants, max_out_cnt)
+		q_list = []
+		for q in subq_list:
+			q_list.append(Aggregate(q, self.group_cols, self.aggr_col, self.aggr_func))
+		return q_list
+
 	def to_dict(self):
 		return {
 			"type": "node",
-			"op": "group_sum",
+			"op": "aggregate",
 			"children": [
 				self.q.to_dict(), 
 				value_to_dict(self.group_cols, "col_index_list"),

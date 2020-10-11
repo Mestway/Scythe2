@@ -5,14 +5,15 @@ from pprint import pprint
 import pandas as pd
 import time
 
-from scythe2.sql import HOLE, Node, Table, Project, Filter, Join, Aggregate
-from scythe2.utils import remove_duplicate_columns, check_table_inclusion, align_table_schema, construct_value_dict
+from scythe2.sql import HOLE, Node, Table, Project, Filter, BVFilter, Join, Aggregate
+from scythe2.synth_utils import *
 
 abstract_combinators = {
 	"project": lambda q: Project(q, cols=HOLE),
-	"filter": lambda q: Unite(q, predicates=HOLE),
+	"filter": lambda q: BVFilter(q, bv=HOLE),
 	"join": lambda q1, q2: Join(q1, q2),
 	"aggregate": lambda q: Aggregate(q, group_cols=HOLE, aggr_col=HOLE, aggr_func=HOLE),
+	"filter_aggregate": lambda q: Aggregate(BVFilter(q, bv=HOLE), group_cols=HOLE, aggr_col=HOLE, aggr_func=HOLE),
 }
 
 def update_tree_value(node, path, new_val):
@@ -32,15 +33,10 @@ class Synthesizer(object):
 	def __init__(self, config=None):
 		if config is None:
 			self.config = {
-				"operators": ["select", "unite", "filter", "separate", "spread", 
-					"gather", "group_sum", "cumsum", "mutate", "mutate_custom"],
+				"operators": ["join", "filter_aggregate"],
 				"filer_op": [">", "<", "=="],
 				"constants": [],
-				"aggr_func": ["mean", "sum", "count"],
-				"mutate_op": ["+", "-"],
-				"gather_max_val_list_size": 3,
-				"gather_max_key_list_size": 3,
-				"consider_non_consecutive_gather_keys": False,
+				"aggr_func": ["max"]#["sum", "count", "max", "min"]
 			}
 		else:
 			self.config = config
@@ -56,18 +52,34 @@ class Synthesizer(object):
 		new_vals = out_val_set - inp_val_set
 		
 		candidates = {}
-		for level in range(0, size + 1):
+		for level in range(0, size + 3):
 			candidates[level] = []
+
+		for level in range(0, size + 1):
+			
 			if level == 0:
 				candidates[level] += [Table(data_id=i) for i in range(len(inputs))]
 			else:
-				for p in candidates[level - 1]:
-					for op in abstract_combinators:
-						#ignore operators that are not set
-						if op not in self.config["operators"]:
-							continue
-						q = abstract_combinators[op](copy.copy(p))
-						candidates[level].append(q)
+				for op in abstract_combinators:
+					#ignore operators that are not set
+					if op not in self.config["operators"]:
+						continue
+
+					if op == "join":
+						for q1 in candidates[level - 1]:
+							for q2 in candidates[0]:
+								q = abstract_combinators[op](copy.copy(q1), copy.copy(q2))
+								candidates[level + 1].append(q)
+							for q2 in candidates[1]:
+								q = abstract_combinators[op](copy.copy(q1), copy.copy(q2))
+								candidates[level + 2].append(q)
+
+
+						# TODO: maybe we should support join multiple aggregation
+					else:
+						for q0 in candidates[level - 1]:
+							q = abstract_combinators[op](copy.copy(q0))
+							candidates[level].append(q)
 
 		# for level in range(0, size + 1):
 		# 	candidates[level] = [q for q in candidates[level] if not enum_strategies.disable_sketch(q, new_vals)]
@@ -134,19 +146,108 @@ class Synthesizer(object):
 
 		return recent_candidates, concrete_program_level
 
+	
+	def try_instantiate_proj_and_filter(self, q, inputs, output_table):
+		""" given a candidate program q, input tables inputs, and an output table, decide:
+			(1) if otuput_table can be obtained by filtering and projection on q(inputs)
+			(2) if yes, return candidate projections and filters
+		"""
+
+		constants = self.config["constants"]
+
+		dtypes, table_boundaries = q.infer_output_info(inputs)
+		df = q.eval(inputs)
+
+		schema_alignments = align_table_schema(output_table, df.to_dict(orient="records"), find_all_alignments=True)
+
+		if not schema_alignments:
+			# there is no valid schema alignment exists
+			return [] 
+
+		bv_by_size_w_trace = filter_synth.enum_bv_predicates(df, dtypes, table_boundaries, constants, print_bvs=False)
+
+		output_schema = [key for key in output_table[0]]
+		proj_filter_pairs = []
+		for schema_map in schema_alignments:
+			projected_df = df[[schema_map[h] for h in output_schema]]
+			bv_map = infer_filter_bv(projected_df.to_dict(orient="records"), output_table)
+			#print(bv_map)
+
+			successful_bvs = []
+			for size in bv_by_size_w_trace:
+				for bv in bv_by_size_w_trace[size]:
+
+					# if the projection is 
+					if sum(bv) != len(output_table):
+						continue
+					else:
+						if all([any([bv[i] for i in bv_map[out_row_id]]) for out_row_id in bv_map]):
+							#print(bv)
+							successful_bvs.append(bv)
+
+			for bv in successful_bvs:
+				proj_filter_pairs.append((schema_map, bv))
+
+			if len(proj_filter_pairs) > 0:
+				break
+
+		candidates = []
+		if len(proj_filter_pairs) > 0:
+
+			# for each projection and bv_filter, intantiate a set of queries 
+			for schema_map, bv in proj_filter_pairs:
+				# print("*******************")
+				# print(schema_map)
+				# print("".join(["|" if x else "." for x in bv]))
+				proj_index = [list(df.columns).index(schema_map[c]) for c in schema_map]
+				#print(proj_index)
+
+				# instantiate concrete predicates from the bvfilter
+				pred_lists = filter_synth.instantiate_predicate(df, bv_by_size_w_trace, bv, beam_size=10)
+
+
+				for concrete_q in q.replace_bvfilter_with_filter(inputs, constants, max_out_cnt=10):
+					for pred in pred_lists:
+						#print(filter_synth.pred_to_str(df,pred))
+						candidates.append(Project(Filter(copy.deepcopy(concrete_q), pred), proj_index))
+
+			return candidates
+
+		return []
+
+
 	def iteratively_instantiate_and_print(self, p, inputs, level, print_programs=False):
 		"""iteratively instantiate a program (for the purpose of debugging)"""
 		if print_programs:
 			print(f"{'  '.join(['' for _ in range(level)])}{p.stmt_string()}")
+
 		results = []
 		if p.is_abstract():
 			ast = p.to_dict()
 			var_path = self.pick_vars(ast, inputs)[0]
 			#domain = self.infer_domain(ast, path, inputs)
 			candidates = self.instantiate(ast, var_path, inputs)
+
 			for c in candidates:
 				nd = Node.load_from_dict(c)
 				results += self.iteratively_instantiate_and_print(nd, inputs, level + 1, print_programs)
+			return results
+		else:
+			return [p]
+
+	def iteratively_instantiate(self, p, inputs, level, print_programs=False):
+		"""iteratively instantiate a program (for the purpose of debugging)"""
+		if print_programs:
+			print(f"{'  '.join(['' for _ in range(level)])}{p.stmt_string()}")
+
+		results = []
+		if p.is_abstract():
+			ast = p.to_dict()
+			
+			candidates, _ = self.instantiate_one_level(ast, inputs)
+			for c in candidates:
+				nd = Node.load_from_dict(c)
+				results += self.iteratively_instantiate(nd, inputs, level + 1, print_programs)
 			return results
 		else:
 			return [p]
@@ -155,79 +256,21 @@ class Synthesizer(object):
 		"""Given inputs and output, enumerate all programs in the search space until 
 			find a solution p such that output ⊆ subseteq p(inputs)  """
 		all_sketches = self.enum_sketches(inputs, output, size=max_prog_size)
+
 		candidates = []
 		for level, sketches in all_sketches.items():
 			for s in sketches:
-				concrete_programs = self.iteratively_instantiate_and_print(s, inputs, 1)
+				concrete_programs = self.iteratively_instantiate(s, inputs, 1, True)
+
 				for p in concrete_programs:
-					try:
-						t = p.eval(inputs)
-						if align_table_schema(output, t.to_dict(orient="records")) != None:
-							print(p.stmt_string())
-							print(t)
-							candidates.append(p)
-					except Exception as e:
-						print(f"[error] {sys.exc_info()[0]} {e}")
-						tb = sys.exc_info()[2]
-						tb_info = ''.join(traceback.format_tb(tb))
-						print(tb_info)
-		print("----")
-		print(f"number of programs: {len(candidates)}")
-		return candidates
+					queries = self.try_instantiate_proj_and_filter(p, inputs, output)
+					if queries:
+						for q in queries:
+							#print(q.stmt_string())
+							#print(q.eval(inputs))
+							candidates.append(q)
 
-	def enumerative_synthesis(self, 
-			inputs, output, max_prog_size, 
-			time_limit_sec=None, 
-			solution_limit=None, 
-			disable_provenance_analysis=False):
-		"""Given inputs and output, enumerate all programs with premise check until 
-			find a solution p such that output ⊆ subseteq p(inputs) """
-
-		start_time = time.time()
-
-		all_sketches = self.enum_sketches(inputs, output, size=max_prog_size)
-		candidates = []
-		for level, sketches in all_sketches.items():
-			for s in sketches:
-				print("-->")
-				print(s.stmt_string())
-				ast = s.to_dict()
-				out_df = pd.DataFrame.from_dict(output)
-
-				if disable_provenance_analysis:
-					# disable provenance analysis
-					trimmed_inputs = inputs
-				else:
-					pred, trimmed_inputs = provenance_analysis(ast, out_df, inputs)
-
-					# print(pred.print_str())
-					# print(pd.DataFrame(trimmed_inputs[0]))
-
-
-				if len(trimmed_inputs[0]) == 0:
-					continue
-
-				out_df = remove_duplicate_columns(out_df)
-				# all premise chains for the given ast
-				premise_chains = abstract_eval.backward_eval(ast, out_df)
-
-				remaining_time_limit = time_limit_sec - (time.time() - start_time) if time_limit_sec is not None else None
-				programs = self.iteratively_instantiate_with_premises_check(s, inputs, premise_chains, trimmed_inputs, remaining_time_limit)
-				
-				for p in programs:
-					# check table consistensy
-					t = p.eval(inputs)
-					alignment_result = align_table_schema(output, t.to_dict(orient="records"))
-					if alignment_result != None:
-						candidates.append(p)
-
-					if solution_limit is not None and len(candidates) > solution_limit:
-						return candidates
-				
-				# early return if the termination condition is met
-				# TODO: time_limit may be exceeded if the synthesizer is stuck on iteratively instantiation
-				if time_limit_sec is not None and time.time() - start_time > time_limit_sec:
+				if len(candidates) > 0:
 					return candidates
-
-
+						
 		return candidates
